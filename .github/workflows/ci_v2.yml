@@ -1,0 +1,209 @@
+name: GitHub CI
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: write
+  pull-requests: write
+  statuses: write
+  checks: write
+
+jobs:
+  process-pr:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Verificar se a PR foi aprovada
+        id: check_approval
+        run: |
+          if [[ "${{ github.event.review.state }}" == "approved" ]]; then
+            echo "approved=true" >> $GITHUB_ENV
+          else
+            echo "approved=false" >> $GITHUB_ENV
+          fi
+
+      - name: Verificar tipo da branch
+        if: env.approved == 'true'
+        id: check_branch_type
+        run: |
+          HEAD_REF="${{ github.event.pull_request.head.ref }}"
+          if [[ "$HEAD_REF" =~ ^feature/ ]]; then
+            echo "branch_type=feature" >> $GITHUB_ENV
+            echo "feature_name=$(echo $HEAD_REF | sed 's/feature\///')" >> $GITHUB_ENV
+          elif [[ "$HEAD_REF" =~ ^bugfix/ ]]; then
+            echo "branch_type=bugfix" >> $GITHUB_ENV
+            echo "bugfix_name=$(echo $HEAD_REF | sed 's/bugfix\///')" >> $GITHUB_ENV
+          elif [[ "$HEAD_REF" =~ ^release/ ]]; then
+            echo "branch_type=release" >> $GITHUB_ENV
+            # Extrair a versão do nome da branch
+            VERSION=$(echo "$HEAD_REF" | sed 's/release\///')
+            # Validar versão semântica
+            if [[ ! $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Versão inválida: $VERSION. Use o formato X.Y.Z (ex: 1.0.0)"
+              exit 1
+            fi
+            echo "version=$VERSION" >> $GITHUB_ENV
+            echo "release_branch=$HEAD_REF" >> $GITHUB_ENV
+          elif [[ "$HEAD_REF" =~ ^hotfix/ ]]; then
+            echo "branch_type=hotfix" >> $GITHUB_ENV
+            # Extrair a versão do nome da branch
+            VERSION=$(echo "$HEAD_REF" | sed 's/hotfix\///')
+            # Validar versão semântica
+            if [[ ! $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Versão inválida: $VERSION. Use o formato X.Y.Z (ex: 1.0.0)"
+              exit 1
+            fi
+            echo "version=$VERSION" >> $GITHUB_ENV
+            echo "hotfix_branch=$HEAD_REF" >> $GITHUB_ENV
+          else
+            echo "branch_type=unknown" >> $GITHUB_ENV
+          fi
+
+      - name: Checkout do repositório
+        if: env.approved == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configurar Git
+        if: env.approved == 'true'
+        run: |
+          git config --global user.name 'GitHub Actions'
+          git config --global user.email 'actions@github.com'
+
+      - name: Verificar conflitos
+        if: env.approved == 'true'
+        run: |
+          echo "Verificando conflitos..."
+          git fetch origin ${{ github.event.pull_request.base.ref }}
+          git fetch origin ${{ github.event.pull_request.head.ref }}
+          if ! git merge-base --is-ancestor origin/${{ github.event.pull_request.base.ref }} origin/${{ github.event.pull_request.head.ref }}; then
+            echo "::error::Existem conflitos entre as branches. Por favor, resolva-os antes de prosseguir."
+            exit 1
+          fi
+          echo "Nenhum conflito encontrado."
+
+      - name: Processar feature
+        if: env.approved == 'true' && env.branch_type == 'feature'
+        run: |
+          echo "Processando feature: ${{ env.feature_name }}"
+          # Fazer merge da PR para dev
+          gh pr merge ${{ github.event.pull_request.number }} \
+            --merge \
+            --auto \
+            --delete-branch \
+            --subject "feat: merge ${{ env.feature_name }} into dev" \
+            --body "Merge automático da feature ${{ env.feature_name }} para dev"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Processar bugfix
+        if: env.approved == 'true' && env.branch_type == 'bugfix'
+        run: |
+          echo "Processando bugfix: ${{ env.bugfix_name }}"
+          # Fazer merge da PR para dev
+          gh pr merge ${{ github.event.pull_request.number }} \
+            --merge \
+            --auto \
+            --delete-branch \
+            --subject "fix: merge ${{ env.bugfix_name }} into dev" \
+            --body "Merge automático do bugfix ${{ env.bugfix_name }} para dev"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Processar release
+        if: env.approved == 'true' && env.branch_type == 'release'
+        run: |
+          echo "Processando release: v${{ env.version }}"
+          
+          # Fazer merge da PR para main
+          gh pr merge ${{ github.event.pull_request.number }} \
+            --merge \
+            --auto \
+            --subject "release: v${{ env.version }}" \
+            --body "Release v${{ env.version }}"
+          
+          # Aguardar o merge ser concluído
+          sleep 5
+          
+          echo "Criando tag e release..."
+          # Criar a tag
+          git tag -a "v${{ env.version }}" -m "Release v${{ env.version }}"
+          git push origin "v${{ env.version }}"
+          
+          # Criar a release
+          gh release create "v${{ env.version }}" \
+            --title "Release v${{ env.version }}" \
+            --notes "Release v${{ env.version }}"
+          
+          echo "Sincronizando main com dev..."
+          # Fazer fetch de todas as branches
+          git fetch origin main dev
+          
+          # Fazer checkout da dev
+          git checkout dev
+          
+          # Fazer merge da main
+          git merge origin/main --no-ff -m "chore: sync main into dev after release v${{ env.version }}"
+          
+          # Fazer push direto para dev
+          git push origin dev
+          
+          # Aguardar o merge e sincronização serem concluídos
+          sleep 5
+          
+          echo "Limpando branch de release..."
+          # Deletar a branch de release
+          git push origin --delete ${{ env.release_branch }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Processar hotfix
+        if: env.approved == 'true' && env.branch_type == 'hotfix'
+        run: |
+          echo "Processando hotfix: v${{ env.version }}"
+          
+          # Fazer merge da PR para main
+          gh pr merge ${{ github.event.pull_request.number }} \
+            --merge \
+            --auto \
+            --subject "hotfix: v${{ env.version }}" \
+            --body "Hotfix v${{ env.version }}"
+          
+          # Aguardar o merge ser concluído
+          sleep 5
+          
+          echo "Criando tag e release..."
+          # Criar a tag
+          git tag -a "v${{ env.version }}" -m "Hotfix v${{ env.version }}"
+          git push origin "v${{ env.version }}"
+          
+          # Criar a release
+          gh release create "v${{ env.version }}" \
+            --title "Hotfix v${{ env.version }}" \
+            --notes "Hotfix v${{ env.version }}"
+          
+          echo "Sincronizando main com dev..."
+          # Fazer fetch de todas as branches
+          git fetch origin main dev
+          
+          # Fazer checkout da dev
+          git checkout dev
+          
+          # Fazer merge da main
+          git merge origin/main --no-ff -m "chore: sync main into dev after hotfix v${{ env.version }}"
+          
+          # Fazer push direto para dev
+          git push origin dev
+          
+          # Aguardar o merge e sincronização serem concluídos
+          sleep 5
+          
+          echo "Limpando branch de hotfix..."
+          # Deletar a branch de hotfix
+          git push origin --delete ${{ env.hotfix_branch }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
